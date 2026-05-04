@@ -5,11 +5,11 @@ use std::{collections::BTreeMap, io, rc::Rc};
 use super::{read_write::*, store::*, *};
 use crate::{
     ltp::{
-        heap::HeapNode,
+        heap::{HeapNode, HeapId},
         prop_context::{PropertyContext, PropertyValue},
         prop_type::PropertyType,
         read_write::*,
-        table_context::TableContext,
+        table_context::{TableContext, TableContextInfo, TableRowData, TableRowId},
     },
     ndb::{
         block::{IntermediateTreeBlock, LeafSubNodeTreeEntry, SubNodeTree},
@@ -22,6 +22,53 @@ use crate::{
     },
     AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
 };
+
+/// An empty table context that returns no rows, used when a message has no recipient table
+struct EmptyTableContext {
+    context_info: TableContextInfo,
+}
+
+impl EmptyTableContext {
+    fn new() -> io::Result<Self> {
+        let context_info = TableContextInfo::new(
+            0,      // end_4byte_values
+            0,      // end_2byte_values  
+            0,      // end_1byte_values
+            0,      // end_existence_bitmap
+            HeapId::from(0), // row_index (dummy value)
+            None,   // rows
+            vec![], // empty columns
+        ).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        
+        Ok(Self { context_info })
+    }
+}
+
+impl TableContext for EmptyTableContext {
+    fn context(&self) -> &TableContextInfo {
+        &self.context_info
+    }
+
+    fn rows_matrix<'a>(&'a self) -> Box<dyn 'a + Iterator<Item = &'a TableRowData>> {
+        // Return empty iterator
+        Box::new(std::iter::empty())
+    }
+
+    fn find_row(&self, _id: TableRowId) -> crate::ltp::LtpResult<&TableRowData> {
+        Err(crate::ltp::LtpError::TableRowIdNotFound(_id.into()))
+    }
+
+    fn read_column(
+        &self,
+        _value: &crate::ltp::table_context::TableRowColumnValue,
+        _prop_type: PropertyType,
+    ) -> io::Result<PropertyValue> {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "No columns in empty table"
+        ))
+    }
+}
 
 #[derive(Default, Debug)]
 pub struct MessageProperties {
@@ -310,7 +357,11 @@ where
         });
         let recipient_table =
             match (recipient_table_nodes.next(), recipient_table_nodes.next()) {
-                (None, None) => Err(MessagingError::MessageRecipientTableNotFound.into()),
+                (None, None) => {
+                    // Create empty table when no recipient table exists
+                    let empty_table = EmptyTableContext::new()?;
+                    Ok(Rc::new(empty_table) as Rc<dyn TableContext>)
+                },
                 (Some(node), None) => <<Pst as PstFile>::TableContext as TableContextReadWrite<
                     Pst,
                 >>::read(store.clone(), node),
